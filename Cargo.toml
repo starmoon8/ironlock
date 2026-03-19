@@ -1,5 +1,5 @@
 [package]
-name = "lockbox"
+name = "lockbox-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
@@ -13,6 +13,10 @@ homepage = "https://github.com/christurgeon/lockbox"
 documentation = "https://github.com/christurgeon/lockbox#readme"
 authors = ["Chris Turgeon <turgeonchris3@outlook.com>"]
 exclude = [".github/", "tests/", "*.lb"]
+
+[[bin]]
+name = "lockbox"
+path = "src/main.rs"
 
 [dependencies]
 # CLI argument parsing
