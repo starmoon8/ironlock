@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-20
+
 ### Added
 - `--progress` / `-p` flag for encrypt and decrypt commands to show a progress bar
 - Large file warning when encrypting or decrypting files over 1 GiB (in-memory safety net)
@@ -30,4 +32,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - KDF parameters stored in file header for forward compatibility
 - Colored terminal output with progress indicators
 
+[0.2.0]: https://github.com/christurgeon/lockbox/releases/tag/v0.2.0
 [0.1.0]: https://github.com/christurgeon/lockbox/releases/tag/v0.1.0
