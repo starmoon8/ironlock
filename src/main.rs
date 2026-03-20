@@ -5,14 +5,15 @@ mod file_ops;
 mod memlock;
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use zeroize::Zeroizing;
 
 use cli::{Cli, Commands};
 use error::{LockboxError, Result};
-use file_ops::{decrypt_directory, decrypt_file_to_path, encrypt_directory, encrypt_file};
+use file_ops::{collect_files_recursive, decrypt_file_to_path, encrypt_file, LOCKBOX_EXTENSION};
 use memlock::mlock_slice;
 
 /// Prompt for password input (hidden from terminal)
@@ -87,54 +88,121 @@ fn require_piped_stdin() {
     }
 }
 
-/// Tracks per-file operation results
+/// Count total files for progress bar (expanding directories)
+fn count_files(files: &[PathBuf], filter_lb: bool) -> u64 {
+    let mut count: u64 = 0;
+    for path in files {
+        if path.is_dir() {
+            if let Ok(dir_files) = collect_files_recursive(path) {
+                if filter_lb {
+                    count += dir_files
+                        .iter()
+                        .filter(|f| {
+                            f.extension().and_then(|e| e.to_str()) == Some(LOCKBOX_EXTENSION)
+                        })
+                        .count() as u64;
+                } else {
+                    count += dir_files.len() as u64;
+                }
+            } else {
+                count += 1; // will error during processing
+            }
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Creates a styled progress bar
+fn make_progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb
+}
+
+/// Tracks per-file operation results and optionally displays a progress bar
 struct Counters {
     success: usize,
     errors: usize,
     skipped: usize,
+    pb: Option<ProgressBar>,
 }
 
 impl Counters {
-    fn new() -> Self {
+    fn new(pb: Option<ProgressBar>) -> Self {
         Self {
             success: 0,
             errors: 0,
             skipped: 0,
+            pb,
         }
     }
 
-    /// Handle a single operation result, printing the outcome
-    fn handle_result(&mut self, result: std::result::Result<PathBuf, LockboxError>, shred: bool) {
-        match result {
+    /// Output a line — through the progress bar if active, otherwise println
+    fn output(&self, msg: &str) {
+        match &self.pb {
+            Some(pb) => pb.println(msg),
+            None => println!("{}", msg),
+        }
+    }
+
+    /// Handle a single operation result, printing the outcome.
+    /// `prefix` is the "Encrypting foo ... " text.
+    fn handle_result(
+        &mut self,
+        prefix: &str,
+        result: std::result::Result<PathBuf, LockboxError>,
+        shred: bool,
+    ) {
+        let suffix = match &result {
             Ok(output_path) => {
                 if shred {
-                    println!(
+                    format!(
                         "{} → {} (original securely deleted)",
                         "✓".green(),
                         output_path.display()
-                    );
+                    )
                 } else {
-                    println!("{} → {}", "✓".green(), output_path.display());
+                    format!("{} → {}", "✓".green(), output_path.display())
                 }
-                self.success += 1;
             }
-            Err(LockboxError::Cancelled) => {
-                println!("{}", "skipped".yellow());
-                self.skipped += 1;
-            }
+            Err(LockboxError::Cancelled) => format!("{}", "skipped".yellow()),
             Err(LockboxError::DecryptionFailed) => {
-                println!("{} incorrect password or corrupted file", "✗".red());
-                self.errors += 1;
+                format!("{} incorrect password or corrupted file", "✗".red())
             }
-            Err(e) => {
-                println!("{} {}", "✗".red(), e);
-                self.errors += 1;
-            }
+            Err(e) => format!("{} {}", "✗".red(), e),
+        };
+
+        self.output(&format!("{}{}", prefix, suffix));
+
+        match &result {
+            Ok(_) => self.success += 1,
+            Err(LockboxError::Cancelled) => self.skipped += 1,
+            Err(_) => self.errors += 1,
         }
+
+        if let Some(ref pb) = self.pb {
+            pb.inc(1);
+        }
+    }
+
+    /// Handle a directory-level error
+    fn handle_dir_error(&mut self, e: LockboxError) {
+        self.output(&format!("{} {}", "✗".red(), e));
+        self.errors += 1;
     }
 
     /// Print the final summary line
     fn print_summary(&self, operation: &str) {
+        if let Some(ref pb) = self.pb {
+            pb.finish_and_clear();
+        }
         println!();
         if self.errors == 0 && self.skipped == 0 {
             println!(
@@ -163,6 +231,7 @@ fn run() -> Result<()> {
             files,
             force,
             shred,
+            progress,
         } => {
             if files.is_empty() {
                 require_piped_stdin();
@@ -176,29 +245,32 @@ fn run() -> Result<()> {
                 let password = prompt_password_with_confirm()?;
                 println!();
 
-                let mut counters = Counters::new();
+                let pb = if progress {
+                    Some(make_progress_bar(count_files(&files, false)))
+                } else {
+                    None
+                };
+                let mut counters = Counters::new(pb);
 
                 for file_path in &files {
                     if file_path.is_dir() {
-                        println!("Encrypting directory {} ...", file_path.display());
-                        match encrypt_directory(file_path, password.as_bytes(), force, shred) {
-                            Ok(results) => {
-                                for (source, result) in results {
-                                    print!("  Encrypting {} ... ", source.display());
-                                    io::stdout().flush()?;
-                                    counters.handle_result(result, shred);
+                        counters
+                            .output(&format!("Encrypting directory {} ...", file_path.display()));
+                        match collect_files_recursive(file_path) {
+                            Ok(dir_files) => {
+                                for source in dir_files {
+                                    let prefix = format!("  Encrypting {} ... ", source.display());
+                                    let result =
+                                        encrypt_file(&source, password.as_bytes(), force, shred);
+                                    counters.handle_result(&prefix, result, shred);
                                 }
                             }
-                            Err(e) => {
-                                println!("{} {}", "✗".red(), e);
-                                counters.errors += 1;
-                            }
+                            Err(e) => counters.handle_dir_error(e),
                         }
                     } else {
-                        print!("Encrypting {} ... ", file_path.display());
-                        io::stdout().flush()?;
+                        let prefix = format!("Encrypting {} ... ", file_path.display());
                         let result = encrypt_file(file_path, password.as_bytes(), force, shred);
-                        counters.handle_result(result, shred);
+                        counters.handle_result(&prefix, result, shred);
                     }
                 }
 
@@ -209,6 +281,7 @@ fn run() -> Result<()> {
             files,
             output,
             force,
+            progress,
         } => {
             if files.is_empty() {
                 require_piped_stdin();
@@ -222,39 +295,57 @@ fn run() -> Result<()> {
                 let password = prompt_password_decrypt()?;
                 println!();
 
-                let mut counters = Counters::new();
+                let pb = if progress {
+                    Some(make_progress_bar(count_files(&files, true)))
+                } else {
+                    None
+                };
+                let mut counters = Counters::new(pb);
 
                 for file_path in &files {
                     if file_path.is_dir() {
-                        println!("Decrypting directory {} ...", file_path.display());
-                        match decrypt_directory(
-                            file_path,
-                            password.as_bytes(),
-                            output.as_deref(),
-                            force,
-                        ) {
-                            Ok(results) => {
-                                for (source, result) in results {
-                                    print!("  Decrypting {} ... ", source.display());
-                                    io::stdout().flush()?;
-                                    counters.handle_result(result, false);
+                        counters
+                            .output(&format!("Decrypting directory {} ...", file_path.display()));
+                        match collect_files_recursive(file_path) {
+                            Ok(dir_files) => {
+                                for source in dir_files {
+                                    if source.extension().and_then(|e| e.to_str())
+                                        != Some(LOCKBOX_EXTENSION)
+                                    {
+                                        continue;
+                                    }
+                                    // Compute output dir preserving directory structure
+                                    let relative =
+                                        source.strip_prefix(file_path).unwrap_or(&source);
+                                    let target_dir = match &output {
+                                        Some(base) => {
+                                            base.join(relative.parent().unwrap_or(Path::new("")))
+                                        }
+                                        None => {
+                                            source.parent().unwrap_or(Path::new("")).to_path_buf()
+                                        }
+                                    };
+                                    let prefix = format!("  Decrypting {} ... ", source.display());
+                                    let result = decrypt_file_to_path(
+                                        &source,
+                                        password.as_bytes(),
+                                        Some(&target_dir),
+                                        force,
+                                    );
+                                    counters.handle_result(&prefix, result, false);
                                 }
                             }
-                            Err(e) => {
-                                println!("{} {}", "✗".red(), e);
-                                counters.errors += 1;
-                            }
+                            Err(e) => counters.handle_dir_error(e),
                         }
                     } else {
-                        print!("Decrypting {} ... ", file_path.display());
-                        io::stdout().flush()?;
+                        let prefix = format!("Decrypting {} ... ", file_path.display());
                         let result = decrypt_file_to_path(
                             file_path,
                             password.as_bytes(),
                             output.as_deref(),
                             force,
                         );
-                        counters.handle_result(result, false);
+                        counters.handle_result(&prefix, result, false);
                     }
                 }
 

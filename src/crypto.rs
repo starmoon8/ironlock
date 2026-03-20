@@ -1,6 +1,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use rand::rngs::OsRng;
@@ -14,7 +14,7 @@ use crate::memlock::mlock_slice;
 pub const MAGIC_BYTES: &[u8; 8] = b"LOCKBOX\x01";
 
 /// Version of the file format (for future compatibility)
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Salt length for Argon2id (16 bytes = 128 bits, recommended minimum)
 pub const SALT_LENGTH: usize = 16;
@@ -111,11 +111,15 @@ pub fn generate_nonce() -> [u8; NONCE_LENGTH] {
 /// - Integrity: Poly1305 MAC ensures that data hasn't been tampered with
 /// - Authentication: verifies the cipher text was created with the correct key
 ///
+/// The `aad` (associated data) is authenticated but not encrypted. Pass the file
+/// header as AAD to bind it to the ciphertext. Pass `&[]` for no associated data.
+///
 /// Returns the ciphertext with the 16-byte authentication tag appended.
 pub fn encrypt(
     key: &[u8; KEY_LENGTH],
     nonce: &[u8; NONCE_LENGTH],
     plaintext: &[u8],
+    aad: &[u8],
 ) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| LockboxError::EncryptionFailed(format!("Cipher init failed: {}", e)))?;
@@ -123,7 +127,13 @@ pub fn encrypt(
     let nonce = Nonce::from_slice(nonce);
 
     cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| LockboxError::EncryptionFailed(format!("Encryption failed: {}", e)))
 }
 
@@ -132,12 +142,15 @@ pub fn encrypt(
 /// This function also verifies the authentication tag, ensuring:
 /// - The data hasn't been modified
 /// - The correct password was used
+/// - The associated data (`aad`) matches what was provided during encryption
 ///
-/// Returns an error if authentication fails (wrong password or corrupted data).
+/// Returns an error if authentication fails (wrong password, corrupted data,
+/// or mismatched AAD).
 pub fn decrypt(
     key: &[u8; KEY_LENGTH],
     nonce: &[u8; NONCE_LENGTH],
     ciphertext: &[u8],
+    aad: &[u8],
 ) -> Result<Vec<u8>> {
     let cipher =
         ChaCha20Poly1305::new_from_slice(key).map_err(|_| LockboxError::DecryptionFailed)?;
@@ -145,7 +158,13 @@ pub fn decrypt(
     let nonce = Nonce::from_slice(nonce);
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| LockboxError::DecryptionFailed)
 }
 
@@ -162,7 +181,7 @@ pub fn decrypt(
 // | 27+N   | 12   | ChaCha20 nonce                       |
 // | 39+N   | ...  | Encrypted data + auth tag (16 bytes) |
 //
-// Version 2 (current):
+// Version 2 (legacy):
 // | Offset | Size | Description                          |
 // |--------|------|--------------------------------------|
 // | 0      | 8    | Magic bytes "LOCKBOX\x01"            |
@@ -175,6 +194,12 @@ pub fn decrypt(
 // | 23+N   | 16   | Argon2id salt                        |
 // | 39+N   | 12   | ChaCha20 nonce                       |
 // | 51+N   | ...  | Encrypted data + auth tag (16 bytes) |
+//
+// Version 3 (current):
+//   Same layout as v2, but the entire header (bytes 0..51+N) is passed as
+//   associated data (AAD) to ChaCha20-Poly1305. This authenticates the header
+//   so that tampering with magic bytes, version, KDF params, filename, salt,
+//   or nonce is detected during decryption.
 
 /// Creates the encrypted file format with all metadata using default KDF params
 pub fn create_encrypted_file(
@@ -200,9 +225,7 @@ pub fn create_encrypted_file_with_params(
     let salt = generate_salt();
     let nonce = generate_nonce();
     let key = derive_key_from_password(password, &salt, kdf_params)?;
-    let ciphertext = encrypt(&key, &nonce, plaintext)?;
 
-    // Build the file structure
     let filename_bytes = original_filename.as_bytes();
     if filename_bytes.len() > u16::MAX as usize {
         return Err(LockboxError::EncryptionFailed(
@@ -210,39 +233,45 @@ pub fn create_encrypted_file_with_params(
         ));
     }
     let filename_len = filename_bytes.len() as u16;
-    let mut output = Vec::with_capacity(
-        MAGIC_BYTES.len()
-            + 1 // version
-            + 4 // memory cost
-            + 4 // iterations
-            + 4 // parallelism
-            + 2 // filename length
-            + filename_bytes.len()
-            + SALT_LENGTH
-            + NONCE_LENGTH
-            + ciphertext.len(),
-    );
 
-    // Write header
-    output.extend_from_slice(MAGIC_BYTES);
-    output.push(FORMAT_VERSION);
-    output.extend_from_slice(&kdf_params.memory_kib.to_be_bytes());
-    output.extend_from_slice(&kdf_params.iterations.to_be_bytes());
-    output.extend_from_slice(&kdf_params.parallelism.to_be_bytes());
-    output.extend_from_slice(&filename_len.to_be_bytes());
-    output.extend_from_slice(filename_bytes);
-    output.extend_from_slice(&salt);
-    output.extend_from_slice(&nonce);
-    output.extend_from_slice(&ciphertext);
+    // Build header (everything before ciphertext) — used as AAD
+    let header_size = MAGIC_BYTES.len()
+        + 1 // version
+        + 4 // memory cost
+        + 4 // iterations
+        + 4 // parallelism
+        + 2 // filename length
+        + filename_bytes.len()
+        + SALT_LENGTH
+        + NONCE_LENGTH;
 
-    Ok(output)
+    let mut header = Vec::with_capacity(header_size);
+    header.extend_from_slice(MAGIC_BYTES);
+    header.push(FORMAT_VERSION);
+    header.extend_from_slice(&kdf_params.memory_kib.to_be_bytes());
+    header.extend_from_slice(&kdf_params.iterations.to_be_bytes());
+    header.extend_from_slice(&kdf_params.parallelism.to_be_bytes());
+    header.extend_from_slice(&filename_len.to_be_bytes());
+    header.extend_from_slice(filename_bytes);
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&nonce);
+
+    // Encrypt with header as associated data (authenticated but not encrypted)
+    let ciphertext = encrypt(&key, &nonce, plaintext, &header)?;
+
+    // Reuse header allocation as output buffer
+    header.reserve_exact(ciphertext.len());
+    header.extend_from_slice(&ciphertext);
+
+    Ok(header)
 }
 
 /// Parses an encrypted file and decrypts its contents
 ///
-/// Supports both version 1 (legacy) and version 2 (current) file formats.
+/// Supports version 1 (legacy), version 2 (legacy), and version 3 (current) file formats.
 /// - Version 1: uses hardcoded KDF params (64 MiB, 3 iterations, 4 parallelism)
 /// - Version 2: reads KDF params from the file header
+/// - Version 3: same as v2, but authenticates the header via AAD
 ///
 /// Returns: (original_filename, decrypted_data)
 pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, Vec<u8>)> {
@@ -273,8 +302,9 @@ pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, V
             };
             (kdf, 9usize)
         }
-        2 => {
-            // Version 2: read KDF params from header
+        2 | 3 => {
+            // Version 2 and 3: read KDF params from header
+            // (v3 additionally authenticates the header via AAD)
             if encrypted_data.len() < MINIMUM_SIZE_V2 {
                 return Err(LockboxError::InvalidFileFormat);
             }
@@ -340,7 +370,14 @@ pub fn decrypt_file(password: &[u8], encrypted_data: &[u8]) -> Result<(String, V
 
     // Derive key and decrypt
     let key = derive_key_from_password(password, &salt, &kdf_params)?;
-    let plaintext = decrypt(&key, &nonce, ciphertext)?;
+
+    // v3: authenticate the header via AAD; v1/v2: no AAD (backward compat)
+    let aad = if version == 3 {
+        &encrypted_data[..ciphertext_start]
+    } else {
+        &[]
+    };
+    let plaintext = decrypt(&key, &nonce, ciphertext, aad)?;
 
     Ok((original_filename, plaintext))
 }
@@ -448,8 +485,8 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"Hello, World!";
 
-        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
-        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext, &[]).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -461,8 +498,8 @@ mod tests {
         let nonce2 = [1u8; NONCE_LENGTH];
         let plaintext = b"Hello, World!";
 
-        let ciphertext1 = encrypt(&key, &nonce1, plaintext).unwrap();
-        let ciphertext2 = encrypt(&key, &nonce2, plaintext).unwrap();
+        let ciphertext1 = encrypt(&key, &nonce1, plaintext, &[]).unwrap();
+        let ciphertext2 = encrypt(&key, &nonce2, plaintext, &[]).unwrap();
 
         assert_ne!(
             ciphertext1, ciphertext2,
@@ -477,8 +514,8 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"Secret data";
 
-        let ciphertext = encrypt(&key1, &nonce, plaintext).unwrap();
-        let result = decrypt(&key2, &nonce, &ciphertext);
+        let ciphertext = encrypt(&key1, &nonce, plaintext, &[]).unwrap();
+        let result = decrypt(&key2, &nonce, &ciphertext, &[]);
 
         assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
     }
@@ -490,8 +527,8 @@ mod tests {
         let nonce2 = [1u8; NONCE_LENGTH];
         let plaintext = b"Secret data";
 
-        let ciphertext = encrypt(&key, &nonce1, plaintext).unwrap();
-        let result = decrypt(&key, &nonce2, &ciphertext);
+        let ciphertext = encrypt(&key, &nonce1, plaintext, &[]).unwrap();
+        let result = decrypt(&key, &nonce2, &ciphertext, &[]);
 
         assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
     }
@@ -502,8 +539,8 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"";
 
-        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
-        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext, &[]).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -514,8 +551,8 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = vec![0xABu8; 1024 * 1024]; // 1 MB
 
-        let ciphertext = encrypt(&key, &nonce, &plaintext).unwrap();
-        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, &plaintext, &[]).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext, &[]).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -526,7 +563,7 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"Hello";
 
-        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
 
         // ChaCha20-Poly1305 adds a 16-byte auth tag
         assert_eq!(ciphertext.len(), plaintext.len() + 16);
@@ -538,11 +575,11 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"Secret data";
 
-        let mut ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+        let mut ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
         // Tamper with the ciphertext
         ciphertext[0] ^= 0xFF;
 
-        let result = decrypt(&key, &nonce, &ciphertext);
+        let result = decrypt(&key, &nonce, &ciphertext, &[]);
         assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
     }
 
@@ -552,10 +589,50 @@ mod tests {
         let nonce = [0u8; NONCE_LENGTH];
         let plaintext = b"Secret data";
 
-        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
         let truncated = &ciphertext[..ciphertext.len() - 1];
 
-        let result = decrypt(&key, &nonce, truncated);
+        let result = decrypt(&key, &nonce, truncated, &[]);
+        assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
+    }
+
+    // ==================== Low-Level AAD Tests ====================
+
+    #[test]
+    fn test_encrypt_decrypt_with_aad_roundtrip() {
+        let key = [0u8; KEY_LENGTH];
+        let nonce = [0u8; NONCE_LENGTH];
+        let plaintext = b"Hello, AAD!";
+        let aad = b"authenticated header data";
+
+        let ciphertext = encrypt(&key, &nonce, plaintext, aad).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext, aad).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aad_mismatch_fails() {
+        let key = [0u8; KEY_LENGTH];
+        let nonce = [0u8; NONCE_LENGTH];
+        let plaintext = b"Secret data";
+
+        let ciphertext = encrypt(&key, &nonce, plaintext, b"correct aad").unwrap();
+        let result = decrypt(&key, &nonce, &ciphertext, b"wrong aad");
+
+        assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn test_missing_aad_on_decrypt_fails() {
+        let key = [0u8; KEY_LENGTH];
+        let nonce = [0u8; NONCE_LENGTH];
+        let plaintext = b"Secret data";
+
+        let ciphertext = encrypt(&key, &nonce, plaintext, b"some aad").unwrap();
+        // Decrypt with empty AAD when non-empty was used for encryption
+        let result = decrypt(&key, &nonce, &ciphertext, &[]);
+
         assert!(matches!(result, Err(LockboxError::DecryptionFailed)));
     }
 
@@ -832,19 +909,21 @@ mod tests {
 
     #[test]
     fn test_non_utf8_filename_in_encrypted_data() {
-        // Manually construct encrypted data with invalid UTF-8 in the filename field (v2 format)
+        // Manually construct encrypted data with invalid UTF-8 in the filename field.
+        // Uses v2 header so that AAD is not checked — we want to isolate the UTF-8
+        // validation, not AAD authentication.
         let password = b"password";
         let kdf = KdfParams::current();
         let salt = [0u8; SALT_LENGTH];
         let nonce = [0u8; NONCE_LENGTH];
         let key = derive_key_from_password(password, &salt, &kdf).unwrap();
-        let ciphertext = encrypt(&key, &nonce, b"data").unwrap();
+        let ciphertext = encrypt(&key, &nonce, b"data", &[]).unwrap();
 
         let invalid_utf8_filename: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
 
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC_BYTES);
-        data.push(FORMAT_VERSION);
+        data.push(2); // v2: no AAD check, so we reach the UTF-8 validation
         data.extend_from_slice(&kdf.memory_kib.to_be_bytes());
         data.extend_from_slice(&kdf.iterations.to_be_bytes());
         data.extend_from_slice(&kdf.parallelism.to_be_bytes());
@@ -919,12 +998,13 @@ mod tests {
     #[test]
     fn test_file_exactly_minimum_size_but_invalid() {
         // Construct data that is exactly the v2 minimum size (67 bytes for empty filename)
-        // but has valid magic/version so it reaches the decrypt stage and fails auth
+        // but has valid magic/version so it reaches the decrypt stage and fails auth.
+        // Uses v2 so we test the parsing boundary, not AAD.
         let min_size: usize = 8 + 1 + 12 + 2 + 16 + 12 + 16; // 67
         let mut data = vec![0u8; min_size];
         data[..8].copy_from_slice(MAGIC_BYTES);
-        data[8] = FORMAT_VERSION;
-        // KDF params and filename_len = 0 (already zeroed)
+        data[8] = 2; // v2: isolates parsing from AAD
+                     // KDF params and filename_len = 0 (already zeroed)
 
         let result = decrypt_file(b"password", &data);
         // Should fail at decryption (wrong key / zero KDF params) not at parsing
@@ -953,15 +1033,15 @@ mod tests {
     // ==================== Version 2 Format Tests ====================
 
     #[test]
-    fn test_v2_format_roundtrip() {
-        let password = b"test_v2_roundtrip";
-        let plaintext = b"Version 2 format test data with some content.";
-        let filename = "v2_test.txt";
+    fn test_v3_format_roundtrip() {
+        let password = b"test_v3_roundtrip";
+        let plaintext = b"Version 3 format test data with some content.";
+        let filename = "v3_test.txt";
 
         let encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
 
-        // Verify it is v2
-        assert_eq!(encrypted[8], 2);
+        // Verify it is v3
+        assert_eq!(encrypted[8], 3);
 
         let (recovered_filename, recovered_plaintext) = decrypt_file(password, &encrypted).unwrap();
         assert_eq!(recovered_filename, filename);
@@ -984,7 +1064,7 @@ mod tests {
         let salt = generate_salt();
         let nonce = generate_nonce();
         let key = derive_key_from_password(password, &salt, &v1_kdf).unwrap();
-        let ciphertext = encrypt(&key, &nonce, plaintext).unwrap();
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
 
         // Build a v1-format file manually
         let filename_bytes = filename.as_bytes();
@@ -1038,8 +1118,8 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_encrypted_file_structure() {
-        // Verify the exact header layout of v2 files
+    fn test_v3_encrypted_file_structure() {
+        // Verify the exact header layout of v3 files
         let password = b"password";
         let plaintext = b"structure test";
         let filename = "struct.dat";
@@ -1051,7 +1131,7 @@ mod tests {
         assert_eq!(&encrypted[0..8], MAGIC_BYTES);
 
         // Version at offset 8
-        assert_eq!(encrypted[8], 2u8);
+        assert_eq!(encrypted[8], 3u8);
 
         // KDF memory at offset 9..13
         assert_eq!(
@@ -1098,5 +1178,145 @@ mod tests {
         let ciphertext_len = encrypted.len() - ciphertext_start;
         // plaintext(14) + auth_tag(16) = 30
         assert_eq!(ciphertext_len, plaintext.len() + 16);
+    }
+
+    // ==================== V3 Header Authentication Tests ====================
+
+    #[test]
+    fn test_v3_tampered_filename_detected() {
+        let password = b"password";
+        let plaintext = b"secret data";
+        let filename = "real.txt";
+
+        let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+        assert_eq!(encrypted[8], 3); // v3
+
+        // Tamper with the filename in the header (offset 23: 'r' -> 'x')
+        // Use a valid UTF-8 byte so parsing succeeds but AAD mismatch is detected
+        encrypted[23] = b'x';
+
+        let result = decrypt_file(password, &encrypted);
+        assert!(
+            matches!(result, Err(LockboxError::DecryptionFailed)),
+            "Tampered header filename should be detected via AAD"
+        );
+    }
+
+    #[test]
+    fn test_v3_tampered_kdf_params_detected() {
+        let password = b"password";
+        let plaintext = b"secret data";
+        let filename = "file.txt";
+
+        let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+        assert_eq!(encrypted[8], 3); // v3
+
+        // Tamper with the KDF iterations param (offset 13..17)
+        // Change from 3 to 2 — a valid value that won't OOM but will
+        // derive a different key AND mismatch the AAD
+        let tampered_iterations: u32 = 2;
+        encrypted[13..17].copy_from_slice(&tampered_iterations.to_be_bytes());
+
+        let result = decrypt_file(password, &encrypted);
+        assert!(
+            result.is_err(),
+            "Tampered KDF params in header should be detected"
+        );
+    }
+
+    #[test]
+    fn test_v3_tampered_version_byte_detected() {
+        let password = b"password";
+        let plaintext = b"data";
+        let filename = "file.txt";
+
+        let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+        assert_eq!(encrypted[8], 3);
+
+        // Change version from 3 to 2 — should fail because v2 decrypts without AAD
+        // but the ciphertext was encrypted with v3 AAD
+        encrypted[8] = 2;
+
+        let result = decrypt_file(password, &encrypted);
+        assert!(
+            matches!(result, Err(LockboxError::DecryptionFailed)),
+            "Downgrading version byte from v3 to v2 should fail decryption"
+        );
+    }
+
+    #[test]
+    fn test_v3_downgrade_to_v1_detected() {
+        let password = b"password";
+        let plaintext = b"data";
+        let filename = "file.txt";
+
+        let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+        assert_eq!(encrypted[8], 3);
+
+        // Change version from 3 to 1 — v1 has a different header layout so
+        // offsets shift and decryption will fail
+        encrypted[8] = 1;
+
+        let result = decrypt_file(password, &encrypted);
+        assert!(
+            result.is_err(),
+            "Downgrading version byte from v3 to v1 should fail"
+        );
+    }
+
+    #[test]
+    fn test_v3_tampered_magic_bytes_detected() {
+        let password = b"password";
+        let plaintext = b"data";
+        let filename = "file.txt";
+
+        let mut encrypted = create_encrypted_file(password, filename, plaintext).unwrap();
+
+        // Tamper with last magic byte — this is a pure AAD test since
+        // magic bytes don't affect KDF, nonce, or key derivation.
+        // However, magic byte validation happens before AAD, so this
+        // returns InvalidFileFormat.
+        encrypted[7] ^= 0xFF;
+
+        let result = decrypt_file(password, &encrypted);
+        assert!(
+            matches!(result, Err(LockboxError::InvalidFileFormat)),
+            "Tampered magic bytes should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_v2_backward_compatibility() {
+        // Manually construct a v2-format file and verify decrypt_file can parse it
+        let password = b"v2_compat_password";
+        let filename = "legacy_v2.txt";
+        let plaintext = b"Legacy v2 data";
+
+        let kdf = KdfParams::current();
+        let salt = generate_salt();
+        let nonce = generate_nonce();
+        let key = derive_key_from_password(password, &salt, &kdf).unwrap();
+        // v2: encrypt without AAD
+        let ciphertext = encrypt(&key, &nonce, plaintext, &[]).unwrap();
+
+        // Build a v2-format file manually
+        let filename_bytes = filename.as_bytes();
+        let filename_len = filename_bytes.len() as u16;
+        let mut v2_data = Vec::new();
+        v2_data.extend_from_slice(MAGIC_BYTES);
+        v2_data.push(2); // version 2
+        v2_data.extend_from_slice(&kdf.memory_kib.to_be_bytes());
+        v2_data.extend_from_slice(&kdf.iterations.to_be_bytes());
+        v2_data.extend_from_slice(&kdf.parallelism.to_be_bytes());
+        v2_data.extend_from_slice(&filename_len.to_be_bytes());
+        v2_data.extend_from_slice(filename_bytes);
+        v2_data.extend_from_slice(&salt);
+        v2_data.extend_from_slice(&nonce);
+        v2_data.extend_from_slice(&ciphertext);
+
+        // decrypt_file should handle v2 format (no AAD)
+        let (recovered_filename, recovered_plaintext) = decrypt_file(password, &v2_data).unwrap();
+        assert_eq!(recovered_filename, filename);
+        assert_eq!(recovered_plaintext, plaintext);
     }
 }

@@ -39,6 +39,9 @@ zeroize = { version = "1.7", features = ["derive"] }
 # For colored terminal output
 colored = "2.1"
 
+# Progress bars
+indicatif = "0.17"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

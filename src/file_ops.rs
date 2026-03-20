@@ -11,6 +11,10 @@ use crate::error::{LockboxError, Result};
 /// The extension for encrypted lockbox files
 pub const LOCKBOX_EXTENSION: &str = "lb";
 
+/// Threshold (in bytes) above which we warn about in-memory file loading.
+/// Currently 1 GiB.
+const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024 * 1024;
+
 /// Prompts the user for confirmation
 pub fn prompt_confirmation(message: &str) -> Result<bool> {
     print!("{} [y/N]: ", message);
@@ -134,6 +138,19 @@ pub fn encrypt_file(
     // Check if we should overwrite
     check_overwrite(&output_path, force)?;
 
+    // Warn if the file is very large (everything is loaded into memory)
+    if let Ok(metadata) = fs::metadata(source_path) {
+        let size = metadata.len();
+        if size > LARGE_FILE_THRESHOLD {
+            eprintln!(
+                "Warning: '{}' is {:.1} GiB — Lockbox loads the entire file into memory. \
+                 Ensure you have enough RAM or use stdin piping for very large files.",
+                source_path.display(),
+                size as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
+
     // Read source file (handles NotFound without a separate exists() check)
     let plaintext = fs::read(source_path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
@@ -176,6 +193,19 @@ pub fn decrypt_file_to_path(
 
     if extension != LOCKBOX_EXTENSION {
         return Err(LockboxError::InvalidExtension);
+    }
+
+    // Warn if the file is very large (everything is loaded into memory)
+    if let Ok(metadata) = fs::metadata(source_path) {
+        let size = metadata.len();
+        if size > LARGE_FILE_THRESHOLD {
+            eprintln!(
+                "Warning: '{}' is {:.1} GiB — Lockbox loads the entire file into memory. \
+                 Ensure you have enough RAM or use stdin piping for very large files.",
+                source_path.display(),
+                size as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
     }
 
     // Read encrypted file (handles NotFound without a separate exists() check)
@@ -256,6 +286,7 @@ pub fn collect_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Encrypts all files in a directory recursively, preserving structure.
 /// The .lb files are created alongside the originals.
+#[cfg(test)]
 pub fn encrypt_directory(
     dir: &Path,
     password: &[u8],
@@ -273,6 +304,7 @@ pub fn encrypt_directory(
 
 /// Decrypts all .lb files in a directory recursively.
 /// Output preserves directory structure relative to the source dir.
+#[cfg(test)]
 pub fn decrypt_directory(
     dir: &Path,
     password: &[u8],

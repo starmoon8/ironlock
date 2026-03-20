@@ -34,6 +34,10 @@ pub enum Commands {
         /// Securely delete original files after encryption (overwrites with random data)
         #[arg(short = 's', long, visible_alias = "delete", default_value_t = false)]
         shred: bool,
+
+        /// Show a progress bar when processing multiple files
+        #[arg(short, long, default_value_t = false)]
+        progress: bool,
     },
 
     /// Decrypt one or more .lb files
@@ -53,6 +57,10 @@ pub enum Commands {
         /// Force overwrite without prompting if output file exists
         #[arg(short, long, default_value_t = false)]
         force: bool,
+
+        /// Show a progress bar when processing multiple files
+        #[arg(short, long, default_value_t = false)]
+        progress: bool,
     },
 }
 
@@ -83,11 +91,13 @@ mod tests {
                 files,
                 force,
                 shred,
+                progress,
             } => {
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0], PathBuf::from("file.txt"));
                 assert!(!force);
                 assert!(!shred);
+                assert!(!progress);
             }
             _ => panic!("Expected Encrypt command"),
         }
@@ -144,11 +154,13 @@ mod tests {
                 files,
                 output,
                 force,
+                progress,
             } => {
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0], PathBuf::from("file.lb"));
                 assert!(output.is_none());
                 assert!(!force);
+                assert!(!progress);
             }
             _ => panic!("Expected Decrypt command"),
         }
@@ -192,6 +204,7 @@ mod tests {
                 files,
                 output,
                 force,
+                ..
             } => {
                 assert_eq!(files.len(), 2);
                 assert_eq!(output, Some(PathBuf::from("./out")));
@@ -387,6 +400,46 @@ mod tests {
             _ => panic!("Expected Encrypt command"),
         }
     }
+
+    // ==================== Progress Flag Tests ====================
+
+    #[test]
+    fn test_encrypt_with_progress_short() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "-p", "file.txt"]).unwrap();
+        match cli.command {
+            Commands::Encrypt { progress, .. } => assert!(progress),
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_with_progress_long() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "--progress", "file.txt"]).unwrap();
+        match cli.command {
+            Commands::Encrypt { progress, .. } => assert!(progress),
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_decrypt_with_progress() {
+        let cli = Cli::try_parse_from(["lockbox", "decrypt", "--progress", "file.lb"]).unwrap();
+        match cli.command {
+            Commands::Decrypt { progress, .. } => assert!(progress),
+            _ => panic!("Expected Decrypt command"),
+        }
+    }
+
+    #[test]
+    fn test_progress_defaults_to_false() {
+        let cli = Cli::try_parse_from(["lockbox", "encrypt", "file.txt"]).unwrap();
+        match cli.command {
+            Commands::Encrypt { progress, .. } => assert!(!progress),
+            _ => panic!("Expected Encrypt command"),
+        }
+    }
+
+    // ==================== Mixed Flag Tests ====================
 
     #[test]
     fn test_mixed_flags_and_files() {

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `--progress` / `-p` flag for encrypt and decrypt commands to show a progress bar
+- Large file warning when encrypting or decrypting files over 1 GiB (in-memory safety net)
+- GitHub Actions CI (test, clippy, fmt)
+
+### Changed
+- File format v3: header is now authenticated via AEAD associated data (AAD)
+- Files encrypted with v1 and v2 formats remain fully decryptable (backward compatible)
+
 ## [0.1.0] - 2026-03-18
 
 ### Added

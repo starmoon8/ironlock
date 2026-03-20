@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/lockbox-cli.svg)](https://crates.io/crates/lockbox-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/christurgeon/lockbox/actions/workflows/ci.yaml/badge.svg)](https://github.com/christurgeon/lockbox/actions/workflows/ci.yaml)
+[![CI](https://github.com/christurgeon/lockbox/actions/workflows/ci.yml/badge.svg)](https://github.com/christurgeon/lockbox/actions/workflows/ci.yml)
 
 A secure file encryption CLI tool built in Rust. Lockbox uses industry-standard cryptographic primitives to protect your files with a password.
 
@@ -141,6 +141,7 @@ lockbox d secret.lb -o out/ # same as: lockbox decrypt secret.lb -o out/
 |------|-------|-------------|
 | `--force` | `-f` | Overwrite existing `.lb` files without prompting |
 | `--shred` | `-s` | Securely delete originals after encryption (also `--delete`) |
+| `--progress` | `-p` | Show a progress bar when processing multiple files |
 
 #### Decrypt
 
@@ -148,6 +149,7 @@ lockbox d secret.lb -o out/ # same as: lockbox decrypt secret.lb -o out/
 |------|-------|-------------|
 | `--force` | `-f` | Overwrite existing output files without prompting |
 | `--output <DIR>` | `-o` | Output directory for decrypted files |
+| `--progress` | `-p` | Show a progress bar when processing multiple files |
 
 ## Security
 
@@ -155,10 +157,13 @@ Lockbox uses the following cryptographic primitives:
 
 - **Argon2id** for password-based key derivation (64 MiB memory, 3 iterations, 4 parallelism)
 - **ChaCha20-Poly1305** for authenticated encryption (256-bit keys, 96-bit nonces)
+- **Authenticated header** — the file header (magic bytes, version, KDF params, filename, salt, nonce) is passed as AEAD associated data, preventing undetected tampering
 - **Secure memory handling** via `zeroize` (key material zeroed on drop) and `mlock` (prevents swap to disk on Unix)
 - **Secure deletion** via `--shred` overwrites files with cryptographically random data (3 passes) before unlinking
 
 KDF parameters are stored in the encrypted file header, allowing future upgrades without breaking existing files.
+
+> **Note:** Lockbox currently loads entire files into memory. A warning is displayed for files over 1 GiB. For very large files, consider available RAM or use stdin piping.
 
 ## Development
 
